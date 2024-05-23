@@ -123,10 +123,10 @@ def get_targets(targets):
         l2_target_list.append(trees[targets[i]][3])
         l3_target_list.append(trees[targets[i]][2])
         l4_target_list.append(trees[targets[i]][1])
-    l1_target_list = torch.from_numpy(np.array(l1_target_list))
-    l2_target_list = torch.from_numpy(np.array(l2_target_list))
-    l3_target_list = torch.from_numpy(np.array(l3_target_list))
-    l4_target_list = torch.from_numpy(np.array(l4_target_list))
+    l1_target_list = torch.from_numpy(np.array(l1_target_list)).cuda()
+    l2_target_list = torch.from_numpy(np.array(l2_target_list)).cuda()
+    l3_target_list = torch.from_numpy(np.array(l3_target_list)).cuda()
+    l4_target_list = torch.from_numpy(np.array(l4_target_list)).cuda()
     return l1_target_list, l2_target_list, l3_target_list, l4_target_list
 
 def map_l4_to_l5():

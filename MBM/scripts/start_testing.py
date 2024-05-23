@@ -27,6 +27,10 @@ from MBM.better_mistakes.model.losses import HierarchicalCrossEntropyLoss, Cosin
 from MBM.better_mistakes.trees import load_hierarchy, get_weighting, load_distances, get_classes
 from util import data_loader, logger
 from util.data_loader import is_sorted
+import torch.nn.functional as F
+from cifar100.cifar100_get_tree_target_level5 import get_targets
+from iNat19.inat_get_target_tree import get_target_l7
+from tiered_imagenet.tiered_get_target_tree import get_target_l12
 
 DATASET_NAMES = ["tiered-imagenet-84", "inaturalist19-84", "tiered-imagenet-224", "inaturalist19-224", "cifar-100"]
 LOSS_NAMES = ["cross-entropy", "soft-labels", "hierarchical-cross-entropy", "cosine-distance", "ranking-loss", "cosine-plus-xent", "yolo-v2",
@@ -77,6 +81,108 @@ def main(test_opts):
 
     opts.num_classes = len(classes)
 
+    # HAF++ node embedding generation
+    if opts.feature_space == "haf++":
+        if opts.data == "cifar-100":
+            level_wise_targets = get_targets(torch.arange(len(classes))) + (torch.arange(len(classes)).to(opts.gpu), )
+        elif opts.data == "inaturalist19-224":
+            level_wise_targets = get_target_l7(torch.arange(len(classes))) + (torch.arange(len(classes)).to(opts.gpu), )
+        elif opts.data == "tiered-imagenet-224":
+            level_wise_targets = get_target_l12(torch.arange(len(classes))) + (torch.arange(len(classes)).to(opts.gpu), )
+        else:
+            raise Exception("datset not supported")
+
+        def get_nodes_at_each_level(tree):
+            levels = []
+            def traverse(node, depth=0):
+                if len(levels) <= depth:
+                    levels.append([])  # Create a new level if it doesn't exist
+                if not isinstance(node, str):
+                    levels[depth].append(node.label())
+                    for child in node:
+                        traverse(child, depth + 1)
+                else:
+                    levels[depth].append(str(node))  # Leaf nodes are strings in NLTK trees
+
+            traverse(tree)
+            return levels
+
+        def calculate_max_depth(tree):
+            if isinstance(tree, str):  # Leaf node
+                return 0
+            return 1 + max(calculate_max_depth(child) for child in tree)
+
+        def add_dummy_nodes(tree, current_depth=0, max_depth=None):
+            if max_depth is None:
+                max_depth = calculate_max_depth(tree)
+
+            if isinstance(tree, str) and current_depth == max_depth:  # Leaf node
+                return
+            # if isinstance(tree, str):
+            #     print(tree, current_depth)
+            #     import pdb; pdb.set_trace()
+
+            for i, child in enumerate(tree):
+                if isinstance(child, str):  # If the child is a leaf node
+                    if current_depth < max_depth - 1:  # Add a dummy node if not at max depth
+                        tree[i] = Tree(child, [child])
+                        child = tree[i]
+                    add_dummy_nodes(child, current_depth + 1, max_depth)
+                else:
+                    add_dummy_nodes(child, current_depth + 1, max_depth)
+
+        add_dummy_nodes(hierarchy)
+
+        node_id_to_label = get_nodes_at_each_level(hierarchy)
+        num_classes = 0
+        level_wise_nodes = {}
+        for i, level in enumerate(level_wise_targets):
+            unique_nodes = level.unique()
+            num_classes += len(unique_nodes)
+            level_wise_nodes[i + 1] = sorted(unique_nodes.cpu().numpy())
+        opts.num_classes = num_classes
+
+        node_embeddings = {}
+        max_level = max(list(level_wise_nodes.keys()))
+        for level in level_wise_nodes:
+            if level < max_level:
+                for i, node in enumerate(level_wise_nodes[level]):
+                    # node = f'L{level}-{node}'
+                    node = f'L{level}-{node_id_to_label[level][node]}'
+                    encoded_arr = np.zeros((len(level_wise_nodes[level]), len(level_wise_nodes[level])), dtype=int)
+                    encoded_arr[i][i] = 1.
+                    node_embeddings[node] = encoded_arr[i]
+            else:
+                for i, node in enumerate(classes):
+                    encoded_arr = np.zeros((len(classes), len(classes)), dtype=int)
+                    encoded_arr[i][i] = 1.
+                    node_embeddings[node] = encoded_arr[i]
+
+        leaf_node_embeddings = [[]] * len(classes)
+        leaf_node_masks = [[]] * max_level
+        leaf_values = hierarchy.leaves()
+        for class_ in classes:
+            class_idx = classes.index(class_)
+            leaf_node_embeddings[class_idx] = []
+            leaf_index = leaf_values.index(class_)
+            tree_location = hierarchy.leaf_treeposition(leaf_index)
+            for level, i in enumerate(range(len(tree_location))):
+                try:
+                    label = f'L{level+1}-{hierarchy[tree_location[:i + 1]].label()}'
+                except:
+                    label = hierarchy[tree_location[:i + 1]]
+                leaf_node_embeddings[class_idx].extend(node_embeddings[label])
+                leaf_node_masks[level] = np.zeros(opts.num_classes)
+                start_index = 0
+                for nested_level in range(1, level + 1):
+                    start_index += len(level_wise_nodes[nested_level])
+                end_index = start_index + len(level_wise_nodes[level + 1])
+                leaf_node_masks[level][start_index: end_index] += 1
+            leaf_node_masks[level] = np.zeros(opts.num_classes)
+            leaf_node_masks[level][-len(classes):] += 1
+        leaf_node_embeddings = torch.tensor(leaf_node_embeddings, device=opts.gpu, dtype=torch.float32)
+        leaf_node_masks = torch.tensor(leaf_node_masks, device=opts.gpu, dtype=torch.float32)
+
     # Model, loss, optimizer ------------------------------------------------------------------------------------------------------------------------------
 
     # more setup for devise and b+d
@@ -95,7 +201,7 @@ def main(test_opts):
         assert is_sorted(sorted_keys)
 
     # setup loss
-    if opts.loss == "cross-entropy":
+    if opts.loss == "cross-entropy" and opts.feature_space != "haf++":
         loss_function = nn.CrossEntropyLoss().cuda(opts.gpu)
     elif opts.loss == "soft-labels":
         loss_function = nn.KLDivLoss().cuda(opts.gpu)
@@ -118,6 +224,18 @@ def main(test_opts):
         loss_function = RankingLoss(emb_layer, batch_size=opts.batch_size, single_random_negative=opts.devise_single_negative, margin=0.1).cuda(opts.gpu)
     elif opts.loss == "cosine-plus-xent":
         loss_function = CosinePlusXentLoss(emb_layer).cuda(opts.gpu)
+    elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
+        def loss_func(logits, labels, m=0):
+            out = torch.zeros((labels.shape[0], int(leaf_node_masks[max_level - 1].sum().item())),
+                              device=opts.gpu,
+                              dtype=torch.float32)
+            for j, y_label in enumerate(leaf_node_embeddings):
+                out[:, j] = -torch.norm(logits * (1 - y_label), dim=1)
+            margin = 1 - torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
+            loss_ce = F.cross_entropy(out * margin, labels, reduce=False)
+            loss = loss_ce.mean()
+            return loss, out
+        loss_function = loss_func
     elif opts.loss in LOSS_NAMES:
         loss_function = None
     else:

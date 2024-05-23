@@ -295,6 +295,8 @@ def run(loader, model, loss_function, distances, all_soft_labels, classes, opts,
                         target_distribution = make_batch_onehot_labels(target, opts.num_classes, opts.batch_size,
                                                                        opts.gpu)
                     loss = loss_function(output, target_distribution)
+                elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
+                    loss, output = loss_function(output, target, m=opts.margin)
                 else:
                     loss = loss_function(output, target)
             elif opts.arch == "wide_resnet":
@@ -394,6 +396,8 @@ def run(loader, model, loss_function, distances, all_soft_labels, classes, opts,
                         target_distribution = make_batch_onehot_labels(target, opts.num_classes, opts.batch_size,
                                                                        opts.gpu)
                     loss = loss_function(output, target_distribution)
+                elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
+                    loss, output = loss_function(output, target, m=opts.margin)
                 else:
                     loss = loss_function(output, target)
 

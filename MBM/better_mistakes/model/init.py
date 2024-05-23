@@ -4,6 +4,16 @@ from torchvision import models
 from util.arch import wideresnet, custom_wideresnet, custom_resnet18
 
 
+class HAFS(torch.nn.Module):  # Linear layer to model Hierarchy-Aware Feature Space
+    def __init__(self, in_features, num_classes):
+        super(HAFS, self).__init__()
+        self.linear = torch.nn.Linear(in_features, num_classes)
+
+    def forward(self, input):
+        out = self.linear(input)
+        return out
+
+
 def init_model_on_gpu(gpus_per_node, opts, distances=None):
     arch_dict = models.__dict__
     pretrained = False if not hasattr(opts, "pretrained") else opts.pretrained
@@ -24,7 +34,10 @@ def init_model_on_gpu(gpus_per_node, opts, distances=None):
 
     if opts.arch == "wide_resnet":
         model = wideresnet.WideResNet(num_classes=opts.num_classes)
-        if opts.loss == "cross-entropy" or opts.loss == "soft-labels" or opts.loss == "hierarchical-cross-entropy" or opts.loss == "yolo-v2":
+        if opts.loss == "cross-entropy" and opts.feature_space == "haf++":
+            model = custom_wideresnet.WideResNet(model, feature_size=512, num_classes=opts.num_classes)
+            model.classifier_3 = torch.nn.Sequential(HAFS(512, opts.num_classes))
+        elif opts.loss == "cross-entropy" or opts.loss == "soft-labels" or opts.loss == "hierarchical-cross-entropy" or opts.loss == "yolo-v2":
             model = custom_wideresnet.WideResNet(model, feature_size=512, num_classes=opts.num_classes)
         elif opts.loss == "flamingo-l5":
             model = custom_wideresnet.WideResNet_flamingo_l5(model, feature_size=512, num_classes=[100, 20, 8, 4, 2], gpu=opts.gpu)
@@ -39,7 +52,10 @@ def init_model_on_gpu(gpus_per_node, opts, distances=None):
 
     elif opts.arch == "custom_resnet18":
         model = models.resnet18(pretrained=True)
-        if opts.loss == "cross-entropy" or opts.loss == "soft-labels" or opts.loss == "hierarchical-cross-entropy" or opts.loss == "yolo-v2":
+        if opts.loss == "cross-entropy" and opts.feature_space == "haf++":
+            model = custom_resnet18.ResNet18(model, feature_size=600, num_classes=opts.num_classes)
+            model.classifier_3 = torch.nn.Sequential(HAFS(600, opts.num_classes))
+        elif opts.loss == "cross-entropy" or opts.loss == "soft-labels" or opts.loss == "hierarchical-cross-entropy" or opts.loss == "yolo-v2":
             model = custom_resnet18.ResNet18(model, feature_size=600, num_classes=opts.num_classes)
         elif opts.loss == "ours-l7-cejsd":
             model = custom_resnet18.ResNet18_ours_l7_cejsd(model, feature_size=600, num_classes=[1010, 72, 57, 34, 9, 4, 3], gpu=opts.gpu)
