@@ -181,6 +181,7 @@ def main(test_opts):
             leaf_node_masks[level] = np.zeros(opts.num_classes)
             leaf_node_masks[level][-len(classes):] += 1
         leaf_node_embeddings = torch.tensor(leaf_node_embeddings, device=opts.gpu, dtype=torch.float32)
+        # leaf_node_embeddings = leaf_node_embeddings.repeat(1, 10)
         leaf_node_masks = torch.tensor(leaf_node_masks, device=opts.gpu, dtype=torch.float32)
 
     # Model, loss, optimizer ------------------------------------------------------------------------------------------------------------------------------
@@ -225,15 +226,45 @@ def main(test_opts):
     elif opts.loss == "cosine-plus-xent":
         loss_function = CosinePlusXentLoss(emb_layer).cuda(opts.gpu)
     elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
+        def distance_from_subspaces_batch(points, V):
+            # Compute the dot products between each logit and each vector in V
+            dot_products = torch.matmul(points, V.t())  # Shape: (64, 100)
+
+            # Compute the squared norms of the vectors in V
+            V_norms_squared = torch.sum(V ** 2, dim=1)  # Shape: (100,)
+
+            # Compute the projections
+            projections = (dot_products / V_norms_squared).unsqueeze(2) * V  # Shape: (64, 100, 134)
+
+            # Compute the orthogonal vectors
+            orthogonal_vectors = points.unsqueeze(1) - projections  # Shape: (64, 100, 134)
+
+            # Compute the distances as the norms of the orthogonal vectors
+            distances = torch.norm(orthogonal_vectors, dim=2)  # Shape: (64, 100)
+
+            return distances
         def loss_func(logits, labels, m=0):
-            out = torch.zeros((labels.shape[0], int(leaf_node_masks[max_level - 1].sum().item())),
-                              device=opts.gpu,
-                              dtype=torch.float32)
-            for j, y_label in enumerate(leaf_node_embeddings):
-                out[:, j] = -torch.norm(logits * (1 - y_label), dim=1)
+            # leaf_node_embeddings = torch.eye(100,
+            #                   device=opts.gpu,
+            #                   dtype=torch.float32)
+            out = -distance_from_subspaces_batch(logits, leaf_node_embeddings)
+            # out = torch.zeros((labels.shape[0], int(leaf_node_masks[max_level - 1].sum().item())),
+            #                   device=opts.gpu,
+            #                   dtype=torch.float32)
+
+            # out = (torch.norm(logits, dim=1)**2).view(-1, 1).repeat(1, leaf_node_embeddings.shape[0])
+            # for j, y_label in enumerate(leaf_node_embeddings):
+            #     # out[:, j] = -torch.norm(logits * (1 - y_label), dim=1)
+            #     # out[:, j] -= ((torch.sum(logits * y_label, axis=1) / torch.norm(y_label)) ** 2)
+            #     out[:, j] += torch.norm(logits - ((torch.sum(logits * y_label, axis=1) / torch.norm(y_label))[:, None] * logits), dim=1)
+            # out = -torch.sqrt(out)
             margin = 1 - torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
             loss_ce = F.cross_entropy(out * margin, labels, reduce=False)
             loss = loss_ce.mean()
+            loss_norm = 1 - torch.clamp(torch.norm(logits, dim=1), 0, 1)
+            loss_dist = torch.norm(logits, dim=1) - torch.norm(logits * leaf_node_embeddings[labels], dim=1)
+            loss_sim = 1 - torch.abs(F.cosine_similarity(logits, leaf_node_embeddings[labels]))
+            import pdb; pdb.set_trace()
             return loss, out
         loss_function = loss_func
     elif opts.loss in LOSS_NAMES:

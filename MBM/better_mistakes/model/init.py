@@ -36,7 +36,7 @@ def init_model_on_gpu(gpus_per_node, opts, distances=None):
         model = wideresnet.WideResNet(num_classes=opts.num_classes)
         if opts.loss == "cross-entropy" and opts.feature_space == "haf++":
             model = custom_wideresnet.WideResNet(model, feature_size=512, num_classes=opts.num_classes)
-            model.classifier_3 = torch.nn.Sequential(HAFS(512, opts.num_classes))
+            model.classifier_3 = torch.nn.Sequential(HAFS(512, opts.num_classes * opts.opts.expand_feat_dim))
         elif opts.loss == "cross-entropy" or opts.loss == "soft-labels" or opts.loss == "hierarchical-cross-entropy" or opts.loss == "yolo-v2":
             model = custom_wideresnet.WideResNet(model, feature_size=512, num_classes=opts.num_classes)
         elif opts.loss == "flamingo-l5":
@@ -54,7 +54,7 @@ def init_model_on_gpu(gpus_per_node, opts, distances=None):
         model = models.resnet18(pretrained=True)
         if opts.loss == "cross-entropy" and opts.feature_space == "haf++":
             model = custom_resnet18.ResNet18(model, feature_size=600, num_classes=opts.num_classes)
-            model.classifier_3 = torch.nn.Sequential(HAFS(600, opts.num_classes))
+            model.classifier_3 = torch.nn.Sequential(HAFS(600, opts.num_classes * opts.expand_feat_dim))
         elif opts.loss == "cross-entropy" or opts.loss == "soft-labels" or opts.loss == "hierarchical-cross-entropy" or opts.loss == "yolo-v2":
             model = custom_resnet18.ResNet18(model, feature_size=600, num_classes=opts.num_classes)
         elif opts.loss == "ours-l7-cejsd":
