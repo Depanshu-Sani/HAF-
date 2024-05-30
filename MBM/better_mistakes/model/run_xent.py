@@ -296,7 +296,16 @@ def run(loader, model, loss_function, distances, all_soft_labels, classes, opts,
                                                                        opts.gpu)
                     loss = loss_function(output, target_distribution)
                 elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
-                    loss, output = loss_function(output, target, m=opts.margin)
+                    loss, output = loss_function(output, target, m=opts.margin, log=batch_idx % log_freq)
+                    loss_weights = torch.linalg.matrix_norm(
+                        torch.matmul(
+                            model.classifier_3[0].linear2.weight,
+                            model.classifier_3[0].linear2.weight.T
+                        ) - torch.eye(model.classifier_3[0].linear2.weight.shape[0]).cuda()
+                    )
+                    if batch_idx % log_freq == 0:
+                        print(f"|\tWeights: {loss_weights.item()}")
+                    loss += loss_weights
                 else:
                     loss = loss_function(output, target)
             elif opts.arch == "wide_resnet":
@@ -397,7 +406,16 @@ def run(loader, model, loss_function, distances, all_soft_labels, classes, opts,
                                                                        opts.gpu)
                     loss = loss_function(output, target_distribution)
                 elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
-                    loss, output = loss_function(output, target, m=opts.margin)
+                    loss, output = loss_function(output, target, m=opts.margin, log=batch_idx % log_freq)
+                    loss_weights = torch.linalg.matrix_norm(
+                        torch.matmul(
+                            model.classifier_3[0].linear2.weight,
+                            model.classifier_3[0].linear2.weight.T
+                        ) - torch.eye(model.classifier_3[0].linear2.weight.shape[0]).cuda()
+                    )
+                    if batch_idx % log_freq == 0:
+                        print(f"|\tWeights: {loss_weights.item()}")
+                    loss += loss_weights
                 else:
                     loss = loss_function(output, target)
 
