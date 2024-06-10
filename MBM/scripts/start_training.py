@@ -121,7 +121,14 @@ def main_worker(gpus_per_node, opts):
         node_to_id = map_tree_to_ids(hierarchy)
         opts.num_classes = len(node_to_id)
 
+        def get_orthonormal_vectors(num_classes):
+            gaus = torch.randn(num_classes, num_classes, device=opts.gpu, dtype=torch.float32)
+            svd = torch.linalg.svd(gaus)
+            orth = svd[0] @ svd[2]
+            return orth
+
         orthonormal_basis_vectors = torch.eye(opts.num_classes, device=opts.gpu, dtype=torch.float32)
+        # orthonormal_basis_vectors = get_orthonormal_vectors(opts.num_classes)
         leaf_node_embeddings = torch.zeros((len(classes), opts.num_classes), device=opts.gpu, dtype=torch.float32)
 
         leaf_values = hierarchy.leaves()
@@ -198,12 +205,15 @@ def main_worker(gpus_per_node, opts):
     elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
 
         def loss_func(logits, labels, m=0, log=0):
-            out = -torch.norm(logits, dim=1)[:, None] * (1 - F.cosine_similarity(logits[:, :, None], leaf_node_embeddings.t()[None, :, :])**2)
+            out = -torch.sqrt((torch.norm(logits, dim=1)[:, None] ** 2) * (
+                        1 - F.cosine_similarity(logits[:, :, None], leaf_node_embeddings.t()[None, :, :]) ** 2))
             margin = 1 + torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
             loss_ce = F.cross_entropy(out * margin, labels, reduce=False)
-            loss = loss_ce.mean()
+            # loss_dist = -(out * margin)[range(labels.shape[0]), labels]
+            loss = loss_ce.mean()  # + 0.2 * loss_dist.mean()
             if log == 0:
                 print(f"CE: {loss_ce.mean().item()}", end="")
+            # import pdb; pdb.set_trace()
             return loss, out
         loss_function = loss_func
     elif opts.loss in LOSS_NAMES:
@@ -231,7 +241,7 @@ def main_worker(gpus_per_node, opts):
         do_validate = epoch % opts.val_freq == 0
 
         if opts.data == "inaturalist19-224":
-            if opts.loss == "cross-entropy":
+            if opts.loss == "cross-entropy" and opts.optimizer == "custom_sgd":
                 if opts.arch == "custom_resnet18":
                     optimizer.param_groups[0]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
                     optimizer.param_groups[1]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
@@ -267,7 +277,7 @@ def main_worker(gpus_per_node, opts):
                 optimizer.param_groups[12]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
                 optimizer.param_groups[13]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) / 10
         if opts.data == "cifar-100":
-            if opts.optimizer == "custom_sgd" :
+            if opts.optimizer == "custom_sgd":
                 if opts.loss == "cross-entropy": #or opts.loss == "soft-labels" or opts.loss == "hierarchical-cross-entropy":
                     optimizer.param_groups[0]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)
                     optimizer.param_groups[1]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) / 10

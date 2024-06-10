@@ -8,7 +8,7 @@ class HAFS(torch.nn.Module):  # Linear layer to model Hierarchy-Aware Feature Sp
     def __init__(self, in_features, num_classes):
         super(HAFS, self).__init__()
         self.linear1 = torch.nn.Linear(in_features, num_classes)
-        self.linear2 = torch.nn.Linear(num_classes, num_classes)
+        self.linear2 = torch.nn.Linear(num_classes, num_classes, bias=False)
 
     def forward(self, input):
         out = self.linear1(input).tanh()
