@@ -38,6 +38,7 @@ from cifar100.cifar100_get_tree_target_level5 import get_targets
 from iNat19.inat_get_target_tree import get_target_l7
 from tiered_imagenet.tiered_get_target_tree import get_target_l12
 from nltk.tree import Tree
+from collections import deque
 
 
 CUSTOM_MODELS = ["custom_resnet18", "wide_resnet"]
@@ -99,26 +100,51 @@ def main_worker(gpus_per_node, opts):
 
     # HAF++ node embedding generation
     if opts.feature_space == "haf++":
-        def map_tree_to_ids(tree):
+        def map_tree_to_ids_bfs(tree):
             node_to_id = {}
-            current_id = [0]  # Use a list to keep the current ID mutable
+            current_id = 0
 
-            def assign_ids(node):
+            # Use a queue to keep track of nodes to process
+            queue = deque([tree])
+
+            while queue:
+                node = queue.popleft()
+
                 if isinstance(node, Tree):
                     node_str = node.label()  # Convert the node to its string representation
                 else:
                     node_str = node
+
                 if node_str not in node_to_id and node_str != 'root':  # Check to avoid duplicate keys
-                    node_to_id[node_str] = current_id[0]
-                    current_id[0] += 1
+                    node_to_id[node_str] = current_id
+                    current_id += 1
+
                 if isinstance(node, Tree):
                     for child in node:
-                        assign_ids(child)
+                        queue.append(child)
 
-            assign_ids(tree)
             return node_to_id
 
-        node_to_id = map_tree_to_ids(hierarchy)
+        # def map_tree_to_ids(tree):
+        #     node_to_id = {}
+        #     current_id = [0]  # Use a list to keep the current ID mutable
+        #
+        #     def assign_ids(node):
+        #         if isinstance(node, Tree):
+        #             node_str = node.label()  # Convert the node to its string representation
+        #         else:
+        #             node_str = node
+        #         if node_str not in node_to_id and node_str != 'root':  # Check to avoid duplicate keys
+        #             node_to_id[node_str] = current_id[0]
+        #             current_id[0] += 1
+        #         if isinstance(node, Tree):
+        #             for child in node:
+        #                 assign_ids(child)
+        #
+        #     assign_ids(tree)
+        #     return node_to_id
+
+        node_to_id = map_tree_to_ids_bfs(hierarchy)
         opts.num_classes = len(node_to_id)
 
         def get_orthonormal_vectors(num_classes):
@@ -127,8 +153,8 @@ def main_worker(gpus_per_node, opts):
             orth = svd[0] @ svd[2]
             return orth
 
-        orthonormal_basis_vectors = torch.eye(opts.num_classes, device=opts.gpu, dtype=torch.float32)
-        # orthonormal_basis_vectors = get_orthonormal_vectors(opts.num_classes)
+        # orthonormal_basis_vectors = torch.eye(opts.num_classes, device=opts.gpu, dtype=torch.float32)
+        orthonormal_basis_vectors = get_orthonormal_vectors(opts.num_classes)
         leaf_node_embeddings = torch.zeros((len(classes), opts.num_classes), device=opts.gpu, dtype=torch.float32)
 
         leaf_values = hierarchy.leaves()
@@ -170,14 +196,19 @@ def main_worker(gpus_per_node, opts):
 
     # setup model
     model = init_model_on_gpu(gpus_per_node, opts, distances)
-    if opts.feature_space == "haf++":
-        torch.nn.init.orthogonal_(model.classifier_3[0].linear2.weight)
+    # if opts.feature_space == "haf++":
+    #     torch.nn.init.orthogonal_(model.classifier_3[0].linear2.weight)
 
     # setup optimizer
     optimizer = _select_optimizer(model, opts)
 
     # load from checkpoint if existing
-    steps = _load_checkpoint(opts, model, optimizer)
+    if opts.feature_space == 'haf++':
+        steps, loaded_leaf_node_embeddings = _load_checkpoint(opts, model, optimizer)
+        if loaded_leaf_node_embeddings is not None:
+            leaf_node_embeddings = loaded_leaf_node_embeddings
+    else:
+        steps = _load_checkpoint(opts, model, optimizer)
 
     # setup loss
     if opts.loss == "cross-entropy" and opts.feature_space != "haf++":
@@ -205,15 +236,17 @@ def main_worker(gpus_per_node, opts):
     elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
 
         def loss_func(logits, labels, m=0, log=0):
-            out = -torch.sqrt((torch.norm(logits, dim=1)[:, None] ** 2) * (
-                        1 - F.cosine_similarity(logits[:, :, None], leaf_node_embeddings.t()[None, :, :]) ** 2))
-            margin = 1 + torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
-            loss_ce = F.cross_entropy(out * margin, labels, reduce=False)
-            # loss_dist = -(out * margin)[range(labels.shape[0]), labels]
-            loss = loss_ce.mean()  # + 0.2 * loss_dist.mean()
+            out = -torch.sqrt((torch.norm(logits, dim=1)[:, None] ** 2) * (1 - F.cosine_similarity(logits[:, :, None], leaf_node_embeddings.t()[None, :, :]) ** 2))
+            # margin = 1 + torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
+            # cross-entropy loss
+            loss_ce = F.cross_entropy(out, labels, reduce=False)
+            # distance between the true hyperplane (gt) and feature point
+            loss_true = -out[range(labels.shape[0]), labels]
+            # avg distance between false hyperplanes and feature point
+            loss_false = m - torch.clamp(-(out.sum(1) - out[range(labels.shape[0]), labels]) / (out.shape[1] - 1), 0, m)
+            loss = loss_ce.mean() + loss_true.mean() + loss_false.mean()
             if log == 0:
-                print(f"CE: {loss_ce.mean().item()}", end="")
-            # import pdb; pdb.set_trace()
+                print(f"CE: {loss_ce.mean().item()} | True: {loss_true.mean().item()} | False: {loss_false.mean().item()}")
             return loss, out
         loss_function = loss_func
     elif opts.loss in LOSS_NAMES:
@@ -235,8 +268,8 @@ def main_worker(gpus_per_node, opts):
     num_steps = 20
     step_interval = opts.epochs // num_steps
     for epoch in range(opts.start_epoch, opts.epochs):
-        step = epoch // step_interval
-        opts.margin = min(max_margin, (step / num_steps) * max_margin)
+        # step = epoch // step_interval
+        # opts.margin = min(max_margin, (step / num_steps) * max_margin)
         # do we validate at this epoch?
         do_validate = epoch % opts.val_freq == 0
 
@@ -308,6 +341,8 @@ def main_worker(gpus_per_node, opts):
 
         # print summary of the epoch and save checkpoint
         state = {"epoch": epoch + 1, "steps": steps, "arch": opts.arch, "state_dict": model.state_dict(), "optimizer": optimizer.state_dict()}
+        if opts.feature_space == 'haf++':
+            state["leaf_node_embeddings"] = leaf_node_embeddings
         _save_checkpoint(state, opts.out_folder)
         print("\nSummary for epoch %04d (for train set):" % epoch)
         pp.pprint(summary_train)
@@ -342,6 +377,10 @@ def _load_checkpoint(opts, model, optimizer):
         optimizer.load_state_dict(checkpoint["optimizer"])
         steps = checkpoint["steps"]
         print("=> loaded checkpoint '{}' (epoch {})".format(opts.out_folder, checkpoint["epoch"]))
+        if opts.feature_space == 'haf++':
+            leaf_node_embeddings = checkpoint["leaf_node_embeddings"]
+            print("loaded leaf_node_embeddings")
+            return steps, leaf_node_embeddings
     elif opts.pretrained_folder is not None:
         # import pdb; pdb.set_trace()
         if os.path.exists(opts.pretrained_folder):
@@ -368,7 +407,8 @@ def _load_checkpoint(opts, model, optimizer):
     else:
         steps = 0
         print("=> no checkpoint found at '{}'".format(opts.out_folder))
-
+    if opts.feature_space == 'haf++':
+        return steps, None
     return steps
 
 def _save_checkpoint(state, out_folder, epoch=None):

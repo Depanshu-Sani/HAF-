@@ -32,6 +32,7 @@ from cifar100.cifar100_get_tree_target_level5 import get_targets
 from iNat19.inat_get_target_tree import get_target_l7
 from tiered_imagenet.tiered_get_target_tree import get_target_l12
 from nltk.tree import Tree
+from collections import deque
 
 DATASET_NAMES = ["tiered-imagenet-84", "inaturalist19-84", "tiered-imagenet-224", "inaturalist19-224", "cifar-100"]
 LOSS_NAMES = ["cross-entropy", "soft-labels", "hierarchical-cross-entropy", "cosine-distance", "ranking-loss", "cosine-plus-xent", "yolo-v2",
@@ -86,44 +87,68 @@ def main(test_opts):
 
     # HAF++ node embedding generation
     if opts.feature_space == "haf++":
-        def map_tree_to_ids(tree):
+        def map_tree_to_ids_bfs(tree):
             node_to_id = {}
-            current_id = [0]  # Use a list to keep the current ID mutable
+            current_id = 0
 
-            def assign_ids(node):
+            # Use a queue to keep track of nodes to process
+            queue = deque([tree])
+
+            while queue:
+                node = queue.popleft()
+
                 if isinstance(node, Tree):
                     node_str = node.label()  # Convert the node to its string representation
                 else:
                     node_str = node
+
                 if node_str not in node_to_id and node_str != 'root':  # Check to avoid duplicate keys
-                    node_to_id[node_str] = current_id[0]
-                    current_id[0] += 1
+                    node_to_id[node_str] = current_id
+                    current_id += 1
+
                 if isinstance(node, Tree):
                     for child in node:
-                        assign_ids(child)
+                        queue.append(child)
 
-            assign_ids(tree)
             return node_to_id
+        # def map_tree_to_ids(tree):
+        #     node_to_id = {}
+        #     current_id = [0]  # Use a list to keep the current ID mutable
+        #
+        #     def assign_ids(node):
+        #         if isinstance(node, Tree):
+        #             node_str = node.label()  # Convert the node to its string representation
+        #         else:
+        #             node_str = node
+        #         if node_str not in node_to_id and node_str != 'root':  # Check to avoid duplicate keys
+        #             node_to_id[node_str] = current_id[0]
+        #             current_id[0] += 1
+        #         if isinstance(node, Tree):
+        #             for child in node:
+        #                 assign_ids(child)
+        #
+        #     assign_ids(tree)
+        #     return node_to_id
 
-        node_to_id = map_tree_to_ids(hierarchy)
+        node_to_id = map_tree_to_ids_bfs(hierarchy)
         opts.num_classes = len(node_to_id)
 
-        orthonormal_basis_vectors = torch.eye(opts.num_classes, device=opts.gpu, dtype=torch.float32)
-        leaf_node_embeddings = torch.zeros((len(classes), opts.num_classes), device=opts.gpu, dtype=torch.float32)
-
-        leaf_values = hierarchy.leaves()
-        for class_ in classes:
-            class_idx = classes.index(class_)
-            leaf_index = leaf_values.index(class_)
-            tree_location = hierarchy.leaf_treeposition(leaf_index)
-            for level, i in enumerate(range(len(tree_location))):
-                try:
-                    label = hierarchy[tree_location[:i + 1]].label()
-                except:
-                    label = hierarchy[tree_location[:i + 1]]
-                leaf_node_embeddings[class_idx] += orthonormal_basis_vectors[node_to_id[label]]
-
-        leaf_node_embeddings = leaf_node_embeddings / torch.norm(leaf_node_embeddings, dim=1)[:, None]
+        # orthonormal_basis_vectors = torch.eye(opts.num_classes, device=opts.gpu, dtype=torch.float32)
+        # leaf_node_embeddings = torch.zeros((len(classes), opts.num_classes), device=opts.gpu, dtype=torch.float32)
+        #
+        # leaf_values = hierarchy.leaves()
+        # for class_ in classes:
+        #     class_idx = classes.index(class_)
+        #     leaf_index = leaf_values.index(class_)
+        #     tree_location = hierarchy.leaf_treeposition(leaf_index)
+        #     for level, i in enumerate(range(len(tree_location))):
+        #         try:
+        #             label = hierarchy[tree_location[:i + 1]].label()
+        #         except:
+        #             label = hierarchy[tree_location[:i + 1]]
+        #         leaf_node_embeddings[class_idx] += orthonormal_basis_vectors[node_to_id[label]]
+        #
+        # leaf_node_embeddings = leaf_node_embeddings / torch.norm(leaf_node_embeddings, dim=1)[:, None]
 
     # Model, loss, optimizer ------------------------------------------------------------------------------------------------------------------------------
 
@@ -168,10 +193,17 @@ def main(test_opts):
         loss_function = CosinePlusXentLoss(emb_layer).cuda(opts.gpu)
     elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
         def loss_func(logits, labels, m=0, log=0):
-            out = -torch.norm(logits, dim=1)[:, None] * (1 - F.cosine_similarity(logits[:, :, None], leaf_node_embeddings.t()[None, :, :])**2)
-            margin = 1 - torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
+            out = -torch.sqrt((torch.norm(logits, dim=1)[:, None] ** 2) * (1 - F.cosine_similarity(logits[:, :, None], leaf_node_embeddings.t()[None, :, :]) ** 2))
+            margin = 1 + torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
+            # cross-entropy loss
             loss_ce = F.cross_entropy(out * margin, labels, reduce=False)
-            loss = loss_ce.mean()
+            # distance between the true hyperplane (gt) and feature point
+            loss_true = -(out * margin)[range(labels.shape[0]), labels]
+            # avg distance between false hyperplanes and feature point
+            loss_false = 20 - torch.clamp(-(out.sum(1) - out[range(labels.shape[0]), labels]) / (out.shape[1] - 1), 0, 20)
+            loss = loss_ce.mean() + loss_true.mean() + loss_false.mean()
+            if log == 0:
+                print(f"CE: {loss_ce.mean().item()} | True: {loss_true.mean().item()} | False: {loss_false.mean().item()}")
             return loss, out
         loss_function = loss_func
     elif opts.loss in LOSS_NAMES:
@@ -200,6 +232,7 @@ def main(test_opts):
     if os.path.isfile(checkpoint_path):
         checkpoint = torch.load(checkpoint_path)
         model.load_state_dict(checkpoint["state_dict"])
+        leaf_node_embeddings = checkpoint["leaf_node_embeddings"]
         logger._print("=> loaded checkpoint '{}'".format(checkpoint_path), os.path.join(test_opts.out_folder, "logs.txt"))
     else:
         logger._print("=> no checkpoint found at '{}'".format(checkpoint_path), os.path.join(test_opts.out_folder, "logs.txt"))
@@ -242,6 +275,4 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", default="../../data/", help="Folder containing the supplementary data")
     parser.add_argument("--workers", default=2, type=int, help="number of data loading workers")
     parser.add_argument("--gpu", default=0, type=int, help="GPU id to use.")
-    test_opts = parser.parse_args()
-
-    main(test_opts)
+    test_opts = parser.parse_arg

@@ -7,11 +7,17 @@ from util.arch import wideresnet, custom_wideresnet, custom_resnet18
 class HAFS(torch.nn.Module):  # Linear layer to model Hierarchy-Aware Feature Space
     def __init__(self, in_features, num_classes):
         super(HAFS, self).__init__()
+        self.batch_norm_in = torch.nn.BatchNorm1d(in_features)
         self.linear1 = torch.nn.Linear(in_features, num_classes)
+        self.batch_norm_out = torch.nn.BatchNorm1d(num_classes)
+        self.tanh = torch.nn.Tanh()
         self.linear2 = torch.nn.Linear(num_classes, num_classes, bias=False)
 
     def forward(self, input):
-        out = self.linear1(input).tanh()
+        out = self.batch_norm_in(input)
+        out = self.linear1(out)
+        out = self.batch_norm_out(out)
+        out = self.tanh(out)
         out = self.linear2(out)
         return out
 

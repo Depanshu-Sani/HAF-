@@ -79,7 +79,7 @@ if __name__ == "__main__":
     parser.add_argument("--rerank",default=0,type=int,help='whether to use CRM or not')
     parser.add_argument("--checkpoint_path",default=None,type=str,help='path to the best checkpoint file')
     parser.add_argument("--feature_space", default=None, type=str, help='use haf++ for using the proposed method')
-    parser.add_argument("--margin", default=0, type=float, help='default to 0')
+    parser.add_argument("--margin", default=5, type=float, help='default to 5')
     parser.add_argument("--expand_feat_dim", default=1, type=int, help='default to 0')
 
     opts = parser.parse_args()
