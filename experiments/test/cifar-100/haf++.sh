@@ -1,1 +1,1 @@
-OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python3 main.py --start testing --arch wide_resnet --loss cross-entropy --optimizer custom_sgd --data cifar-100 --workers 16 --output out/cifar-100/haf++ --feature_space haf++
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python3 main.py --start testing --arch wide_resnet --loss cross-entropy --optimizer custom_sgd --data cifar-100 --workers 16 --output out/cifar-100/haf++ --feature_space haf++ --seed 0 --margin 0 --expand_feat_dim 0

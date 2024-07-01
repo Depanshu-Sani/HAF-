@@ -175,18 +175,19 @@ def main_worker(gpus_per_node, opts):
 
         projections_expanded = projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
 
-        def get_distances(logits, batch_size=opts.batch_size, dim=opts.num_classes):
-            # Step 1: Expand logits to shape (batch_size, n_classes, dim)
+        def get_distances(logits, projections, batch_size=opts.batch_size, dim=opts.num_classes):
+            # Step 1: Apply the projection matrices to each point in logits
+            # We avoid expanding logits and use broadcasting directly
             n_classes = len(classes)
-            logits_expanded = logits.unsqueeze(1).expand(batch_size, n_classes, dim)  # Shape (batch_size, n_classes, dim)
+            logits = logits.view(batch_size, 1, dim)
+            projections = projections.view(1, n_classes, dim, dim)
 
-            # Step 2: Apply the projection matrices to each point in logits
-            # Matrix multiplication of shape (batch_size, n_classes, dim) @ (n_classes, dim, dim) -> (batch_size, n_classes, dim)
-            projected_points = torch.einsum('bcd,bced->bce', logits_expanded, projections_expanded)
+            # Matrix multiplication of shape (batch_size, 1, dim) @ (1, n_classes, dim, dim) -> (batch_size, n_classes, dim)
+            projected_points = torch.einsum('bid,bicd->bic', logits, projections)
 
-            # Step 3: Compute the Euclidean distance ||logits - projected_points||
-            # Shape (batch_size, n_classes, dim) - (batch_size, n_classes, dim) -> (batch_size, n_classes, dim) -> (batch_size, n_classes)
-            distances = torch.norm(logits_expanded - projected_points, dim=2)
+            # Step 2: Compute the Euclidean distance ||logits - projected_points||
+            # We use broadcasting directly without expanding
+            distances = torch.norm(logits - projected_points, dim=2)
             return distances
 
         def get_reg_loss(projection_norm, projection_labels):
@@ -205,17 +206,17 @@ def main_worker(gpus_per_node, opts):
 
             return clamped_norm.sum(1) / clamped_norm.shape[0]
 
-        def get_reg_norm(logits, labels, batch_size=opts.batch_size, dim=opts.num_classes):
-            # Step 1: Expand logits to shape (batch_size, n_classes, dim)
+        def get_reg_norm(logits, labels, projections, batch_size=opts.batch_size, dim=opts.num_classes):
+            # Step 1: Apply the projection matrices to each point in logits
+            # We avoid expanding logits and use broadcasting directly
             n_classes = len(classes)
-            logits_expanded = logits.unsqueeze(1).expand(batch_size, n_classes, dim)  # Shape (batch_size, n_classes, dim)
+            logits = logits.view(batch_size, 1, dim)
+            projections = projections.view(1, n_classes, dim, dim)
 
-            # Step 2: Apply the projection matrices to each point in logits
-            # Matrix multiplication of shape (batch_size, n_classes, dim) @ (n_classes, dim, dim) -> (batch_size, n_classes, dim)
-            projected_points = torch.einsum('bcd,bced->bce', logits_expanded, projections_expanded)
+            # Matrix multiplication of shape (batch_size, 1, dim) @ (1, n_classes, dim, dim) -> (batch_size, n_classes, dim)
+            projected_points = torch.einsum('bid,bicd->bic', logits, projections)
 
-            # Step 3: Compute the Euclidean distance ||logits - projected_points||
-            # Shape (batch_size, n_classes, dim) - (batch_size, n_classes, dim) -> (batch_size, n_classes, dim) -> (batch_size, n_classes)
+            # Step 2: Compute the squared Euclidean norm ||projected_points||
             norm = torch.square(torch.norm(projected_points, dim=2))
 
             reg_loss = get_reg_loss(norm, labels)
@@ -259,7 +260,8 @@ def main_worker(gpus_per_node, opts):
     if opts.feature_space == 'haf++':
         steps, loaded_projections = _load_checkpoint(opts, model, optimizer)
         if loaded_projections is not None:
-            projections = loaded_projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
+            projections = loaded_projections
+            projections_expanded = projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
     else:
         steps = _load_checkpoint(opts, model, optimizer)
 
@@ -288,10 +290,10 @@ def main_worker(gpus_per_node, opts):
         loss_function = CosinePlusXentLoss(emb_layer).cuda(opts.gpu)
     elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
         def loss_func(logits, labels, m=0, log=0):
-            out = -get_distances(logits)
+            out = -get_distances(logits, projections)
             margin = 1 + torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
             loss_ce = F.cross_entropy(out * margin, labels)
-            loss_reg = get_reg_norm(logits, labels)
+            loss_reg = get_reg_norm(logits, labels, projections)
             alpha = 0.6
             loss = alpha * loss_ce.mean() + (1 - alpha) * loss_reg.mean()
             if log == 0:

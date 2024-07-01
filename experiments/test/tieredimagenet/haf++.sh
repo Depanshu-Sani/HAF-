@@ -1,1 +1,1 @@
-python main.py --start testing --seed 0 --arch custom_resnet18 --loss cross-entropy --optimizer custom_sgd --data tiered-imagenet-224 --workers 16 --output out/tieredimagenet/haf++/ --feature_space haf++
+python main.py --start testing --seed 0 --arch custom_resnet18 --loss cross-entropy --optimizer custom_sgd --data tiered-imagenet-224 --workers 16 --output out/tieredimagenet/haf++/ --feature_space haf++ --seed 0 --margin 0 --expand_feat_dim 0

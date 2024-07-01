@@ -1,1 +1,1 @@
-python main.py --start training --arch custom_resnet18 --batch-size 256 --epochs 100 --loss cross-entropy --optimizer custom_sgd --data inaturalist19-224 --workers 16 --output out/inat/cross-entropy --seed 0 --feature_space haf++
+python main.py --start training --arch custom_resnet18 --batch-size 256 --epochs 100 --loss cross-entropy --optimizer custom_sgd --data inaturalist19-224 --workers 16 --output out/inat/haf++ --feature_space haf++ --seed 0 --margin 0 --expand_feat_dim 0

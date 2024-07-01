@@ -1,1 +1,1 @@
-python main.py --start training --arch custom_resnet18 --batch-size 256 --loss cross-entropy --optimizer adam_amsgrad --data tiered-imagenet-224 --workers 16 --output out/tieredimagenet/haf++ --seed 0 --feature_space haf++
+python main.py --start training --arch custom_resnet18 --batch-size 256 --loss cross-entropy --optimizer adam_amsgrad --data tiered-imagenet-224 --workers 16 --output out/tieredimagenet/haf++ --feature_space haf++ --seed 0 --margin 0 --expand_feat_dim 0

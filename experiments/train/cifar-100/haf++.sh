@@ -1,1 +1,1 @@
-python main.py --start training --arch wide_resnet --batch-size 64 --epochs 100 --loss cross-entropy --optimizer custom_sgd --data cifar-100 --workers 16 --output out/cifar-100/haf++ --seed 0 --feature_space haf++
+python main.py --start training --arch wide_resnet --batch-size 64 --epochs 100 --loss cross-entropy --optimizer custom_sgd --data cifar-100 --workers 16 --output out/cifar-100/haf++ --feature_space haf++ --seed 0 --margin 0 --expand_feat_dim 0
