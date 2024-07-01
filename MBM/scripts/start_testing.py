@@ -87,6 +87,23 @@ def main(test_opts):
 
     # HAF++ node embedding generation
     if opts.feature_space == "haf++":
+        if opts.data == "cifar-100":
+            max_level = 5
+            # level_wise_targets = get_targets(torch.arange(len(classes))) + (torch.arange(len(classes)).to(opts.gpu), )
+        elif opts.data == "inaturalist19-224":
+            max_level = 7
+            # level_wise_targets = get_target_l7(torch.arange(len(classes))) + (torch.arange(len(classes)).to(opts.gpu), )
+        elif opts.data == "tiered-imagenet-224":
+            max_level = 12
+            # level_wise_targets = get_target_l12(torch.arange(len(classes))) + (torch.arange(len(classes)).to(opts.gpu), )
+        else:
+            raise Exception("datset not supported")
+
+        distance_matrix = torch.zeros((len(classes), len(classes)), device=opts.gpu)
+        for c1 in classes:
+            for c2 in classes:
+                distance_matrix[classes.index(c1), classes.index(c2)] = distances[(c1, c2)]
+
         def map_tree_to_ids_bfs(tree):
             node_to_id = {}
             current_id = 0
@@ -111,44 +128,65 @@ def main(test_opts):
                         queue.append(child)
 
             return node_to_id
-        # def map_tree_to_ids(tree):
-        #     node_to_id = {}
-        #     current_id = [0]  # Use a list to keep the current ID mutable
-        #
-        #     def assign_ids(node):
-        #         if isinstance(node, Tree):
-        #             node_str = node.label()  # Convert the node to its string representation
-        #         else:
-        #             node_str = node
-        #         if node_str not in node_to_id and node_str != 'root':  # Check to avoid duplicate keys
-        #             node_to_id[node_str] = current_id[0]
-        #             current_id[0] += 1
-        #         if isinstance(node, Tree):
-        #             for child in node:
-        #                 assign_ids(child)
-        #
-        #     assign_ids(tree)
-        #     return node_to_id
 
         node_to_id = map_tree_to_ids_bfs(hierarchy)
-        opts.num_classes = len(node_to_id)
+        opts.num_classes = len(node_to_id) + opts.expand_feat_dim * len(classes)
 
-        # orthonormal_basis_vectors = torch.eye(opts.num_classes, device=opts.gpu, dtype=torch.float32)
-        # leaf_node_embeddings = torch.zeros((len(classes), opts.num_classes), device=opts.gpu, dtype=torch.float32)
-        #
-        # leaf_values = hierarchy.leaves()
-        # for class_ in classes:
-        #     class_idx = classes.index(class_)
-        #     leaf_index = leaf_values.index(class_)
-        #     tree_location = hierarchy.leaf_treeposition(leaf_index)
-        #     for level, i in enumerate(range(len(tree_location))):
-        #         try:
-        #             label = hierarchy[tree_location[:i + 1]].label()
-        #         except:
-        #             label = hierarchy[tree_location[:i + 1]]
-        #         leaf_node_embeddings[class_idx] += orthonormal_basis_vectors[node_to_id[label]]
-        #
-        # leaf_node_embeddings = leaf_node_embeddings / torch.norm(leaf_node_embeddings, dim=1)[:, None]
+        def find_siblings(tree):
+            # Initialize a dictionary to store siblings of leaf nodes
+            siblings_dict = {}
+
+            # Function to recursively find siblings of leaf nodes
+            def get_siblings(subtree, parent=None):
+                if isinstance(subtree, Tree):
+                    for child in subtree:
+                        get_siblings(child, subtree)
+                else:
+                    # If it's a leaf node, find its siblings
+                    if parent:
+                        siblings = [classes.index(child) for child in parent if child != subtree]
+                        siblings_dict[classes.index(subtree)] = siblings
+
+            # Start the recursive function
+            get_siblings(tree)
+
+            return siblings_dict
+
+        leaf_siblings = find_siblings(hierarchy)
+        min_n_siblings = min([len(leaf_siblings[k]) for k in leaf_siblings.keys()])
+        siblings = torch.full((len(classes), min_n_siblings), -1)
+        for k in leaf_siblings.keys():
+            siblings[k] = torch.tensor(leaf_siblings[k][:min_n_siblings], device=opts.gpu)
+
+        def get_distances(logits, batch_size=opts.batch_size, dim=opts.num_classes):
+            n_classes = len(classes)
+            # Step 1: Expand logits to shape (batch_size, n_classes, dim)
+            logits_expanded = logits.unsqueeze(1).expand(batch_size, n_classes, dim)  # Shape (batch_size, n_classes, dim)
+
+            # Step 2: Apply the projection matrices to each point in logits
+            # Matrix multiplication of shape (batch_size, n_classes, dim) @ (n_classes, dim, dim) -> (batch_size, n_classes, dim)
+            projected_points = torch.einsum('bcd,bced->bce', logits_expanded, projections_expanded)
+
+            # Step 3: Compute the Euclidean distance ||logits - projected_points||
+            # Shape (batch_size, n_classes, dim) - (batch_size, n_classes, dim) -> (batch_size, n_classes, dim) -> (batch_size, n_classes)
+            distances = torch.norm(logits_expanded - projected_points, dim=2)
+            return distances
+
+        def get_reg_loss(out_distance, projection_labels):
+            normalized_out_distance = ((out_distance - out_distance.min(dim=1)[0][:, None]) / (out_distance.max(dim=1)[0][:, None] - out_distance.min(dim=1)[0][:, None])) * max_level
+            min_distances = distance_matrix[
+                projection_labels.unsqueeze(1), torch.arange(out_distance.shape[1], device=out_distance.device)]
+
+            # Create a mask for the range (min_distance, min_distance + 1)
+            mask = (normalized_out_distance > min_distances) & (normalized_out_distance < min_distances + 1)
+
+            # Initialize clamped_norm with absolute differences
+            clamped_norm = torch.abs(normalized_out_distance - (min_distances + 0.5))
+
+            # Set values within the specified range to zero
+            clamped_norm[mask] = 0
+
+            return clamped_norm.sum(1) / clamped_norm.shape[0]
 
     # Model, loss, optimizer ------------------------------------------------------------------------------------------------------------------------------
 
@@ -193,17 +231,29 @@ def main(test_opts):
         loss_function = CosinePlusXentLoss(emb_layer).cuda(opts.gpu)
     elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
         def loss_func(logits, labels, m=0, log=0):
-            out = -torch.sqrt((torch.norm(logits, dim=1)[:, None] ** 2) * (1 - F.cosine_similarity(logits[:, :, None], leaf_node_embeddings.t()[None, :, :]) ** 2))
-            margin = 1 + torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
+            out = -get_distances(logits)
             # cross-entropy loss
-            loss_ce = F.cross_entropy(out * margin, labels, reduce=False)
-            # distance between the true hyperplane (gt) and feature point
-            loss_true = -(out * margin)[range(labels.shape[0]), labels]
-            # avg distance between false hyperplanes and feature point
-            loss_false = 20 - torch.clamp(-(out.sum(1) - out[range(labels.shape[0]), labels]) / (out.shape[1] - 1), 0, 20)
-            loss = loss_ce.mean() + loss_true.mean() + loss_false.mean()
+            loss_ce = F.cross_entropy(out, labels, reduce=False)
+            loss_reg = get_reg_loss(-out, labels)
+            loss_true = -out[range(labels.shape[0]), labels]
+            dist_siblings = -out[torch.arange(labels.shape[0]).unsqueeze(1).expand(labels.shape[0], siblings.shape[1]), siblings[labels]]
+            intra_class_dist = torch.concat((loss_true[:, None], dist_siblings), dim=1)
+            loss_ce_intra = F.cross_entropy(-intra_class_dist, torch.zeros(labels.shape, device=opts.gpu, dtype=int))
+            loss_siblings = dist_siblings
+            mask = torch.ones((labels.shape[0], out.shape[1]), dtype=torch.bool)
+            mask[torch.arange(labels.shape[0]), labels] = False
+            for i in range(labels.shape[0]):
+                mask[i, siblings[labels][i]] = False
+            dist_not_siblings = -out[mask].view(labels.shape[0], -1)
+            # print(siblings)
+            # distance between the true hyperplane (gt) and feature vector
+            # loss_dist = -out[range(labels.shape[0]), labels]
+            # length of feature vectors
+            # loss_norm = m - torch.clamp(torch.norm(logits, dim=1), 0, m)
+            # loss = loss_ce.mean() + loss_dist.mean() + loss_norm.mean()
+            loss = loss_ce.mean()
             if log == 0:
-                print(f"CE: {loss_ce.mean().item()} | True: {loss_true.mean().item()} | False: {loss_false.mean().item()}")
+                print(f"CE: {loss_ce.mean().item()} | CE-Intra: {loss_ce_intra.mean().item()} | True: {loss_true.mean().item()} | Siblings: {loss_siblings.min(1)[0].mean().item()} | Not Siblings: {dist_not_siblings.min(1)[0].mean().item()}")
             return loss, out
         loss_function = loss_func
     elif opts.loss in LOSS_NAMES:
@@ -232,7 +282,10 @@ def main(test_opts):
     if os.path.isfile(checkpoint_path):
         checkpoint = torch.load(checkpoint_path)
         model.load_state_dict(checkpoint["state_dict"])
-        leaf_node_embeddings = checkpoint["leaf_node_embeddings"]
+        if opts.feature_space == 'haf++':
+            projections = checkpoint["projections"]
+            projections_expanded = projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
+            print("loaded level_wise_projections")
         logger._print("=> loaded checkpoint '{}'".format(checkpoint_path), os.path.join(test_opts.out_folder, "logs.txt"))
     else:
         logger._print("=> no checkpoint found at '{}'".format(checkpoint_path), os.path.join(test_opts.out_folder, "logs.txt"))

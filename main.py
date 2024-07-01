@@ -37,7 +37,7 @@ if __name__ == "__main__":
     parser.add_argument("--arch", default="resnet18", choices=MODEL_NAMES, help="model architecture: | ".join(MODEL_NAMES))
     parser.add_argument("--loss", default="cross-entropy", choices=LOSS_NAMES, help="loss type: | ".join(LOSS_NAMES))
     parser.add_argument("--optimizer", default="adam_amsgrad", choices=OPTIMIZER_NAMES, help="optimizer type: | ".join(OPTIMIZER_NAMES))
-    parser.add_argument("--lr", default=1e-5, type=float, help="initial learning rate of optimizer")
+    parser.add_argument("--lr", default=0.1, type=float, help="initial learning rate of optimizer")
     parser.add_argument("--weight_decay", default=0.0, type=float, help="weight decay of optimizer")
     parser.add_argument("--pretrained", type=boolean, default=True, help="start from ilsvrc12/imagenet model weights")
     parser.add_argument("--pretrained_folder", type=str, default=None, help="folder or file from which to load the network weights")
@@ -80,7 +80,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_path",default=None,type=str,help='path to the best checkpoint file')
     parser.add_argument("--feature_space", default=None, type=str, help='use haf++ for using the proposed method')
     parser.add_argument("--margin", default=5, type=float, help='default to 5')
-    parser.add_argument("--expand_feat_dim", default=1, type=int, help='default to 0')
+    parser.add_argument("--expand_feat_dim", default=0, type=int, help='default to 0')
 
     opts = parser.parse_args()
 
@@ -91,6 +91,8 @@ if __name__ == "__main__":
 
     # setup output folder
     opts.out_folder = opts.output if opts.output else get_expm_folder(__file__, "out", opts.expm_id)
+    if opts.feature_space == "haf++":
+        opts.out_folder = os.path.join(opts.out_folder, f"seed-{opts.seed}", f"expand_dim-{opts.expand_feat_dim}", f"margin={opts.margin}")
     if not os.path.exists(opts.out_folder):
         print("Making experiment folder and subfolders under: ", opts.out_folder)
         os.makedirs(os.path.join(opts.out_folder))

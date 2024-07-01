@@ -54,11 +54,11 @@ DATASET_NAMES = ["tiered-imagenet-84", "inaturalist19-84", "tiered-imagenet-224"
 
 # config = None
 
-def cosine_anneal_schedule(t, nb_epoch):
+def cosine_anneal_schedule(t, nb_epoch, start_lr = 0.1):
     cos_inner = np.pi * (t % nb_epoch)  # t - 1 is used when t has 1-based indexing.
     cos_inner /= nb_epoch
     cos_out = np.cos(cos_inner) + 1
-    return float( 0.1 / 2 * cos_out)
+    return float(start_lr / 2 * cos_out)
 
 
 def main_worker(gpus_per_node, opts):
@@ -100,6 +100,20 @@ def main_worker(gpus_per_node, opts):
 
     # HAF++ node embedding generation
     if opts.feature_space == "haf++":
+        if opts.data == "cifar-100":
+            max_level = 5
+            # level_wise_targets = get_targets(torch.arange(len(classes))) + (torch.arange(len(classes)).to(opts.gpu), )
+        elif opts.data == "inaturalist19-224":
+            max_level = 7
+            # level_wise_targets = get_target_l7(torch.arange(len(classes))) + (torch.arange(len(classes)).to(opts.gpu), )
+        elif opts.data == "tiered-imagenet-224":
+            max_level = 12
+            # level_wise_targets = get_target_l12(torch.arange(len(classes))) + (torch.arange(len(classes)).to(opts.gpu), )
+        else:
+            raise Exception("datset not supported")
+
+        # max_level = len(level_wise_targets)
+
         def map_tree_to_ids_bfs(tree):
             node_to_id = {}
             current_id = 0
@@ -125,27 +139,8 @@ def main_worker(gpus_per_node, opts):
 
             return node_to_id
 
-        # def map_tree_to_ids(tree):
-        #     node_to_id = {}
-        #     current_id = [0]  # Use a list to keep the current ID mutable
-        #
-        #     def assign_ids(node):
-        #         if isinstance(node, Tree):
-        #             node_str = node.label()  # Convert the node to its string representation
-        #         else:
-        #             node_str = node
-        #         if node_str not in node_to_id and node_str != 'root':  # Check to avoid duplicate keys
-        #             node_to_id[node_str] = current_id[0]
-        #             current_id[0] += 1
-        #         if isinstance(node, Tree):
-        #             for child in node:
-        #                 assign_ids(child)
-        #
-        #     assign_ids(tree)
-        #     return node_to_id
-
         node_to_id = map_tree_to_ids_bfs(hierarchy)
-        opts.num_classes = len(node_to_id)
+        opts.num_classes = len(node_to_id)  # dimension of HAFS is equal to the number of nodes in the tree
 
         def get_orthonormal_vectors(num_classes):
             gaus = torch.randn(num_classes, num_classes, device=opts.gpu, dtype=torch.float32)
@@ -154,22 +149,77 @@ def main_worker(gpus_per_node, opts):
             return orth
 
         # orthonormal_basis_vectors = torch.eye(opts.num_classes, device=opts.gpu, dtype=torch.float32)
-        orthonormal_basis_vectors = get_orthonormal_vectors(opts.num_classes)
-        leaf_node_embeddings = torch.zeros((len(classes), opts.num_classes), device=opts.gpu, dtype=torch.float32)
+        orthonormal_basis_vectors = get_orthonormal_vectors(opts.num_classes + opts.expand_feat_dim * len(classes))
+        projections = torch.zeros((len(classes), (opts.num_classes + opts.expand_feat_dim * len(classes)), (opts.num_classes + opts.expand_feat_dim * len(classes))), device=opts.gpu, dtype=torch.float32)
 
         leaf_values = hierarchy.leaves()
         for class_ in classes:
             class_idx = classes.index(class_)
             leaf_index = leaf_values.index(class_)
             tree_location = hierarchy.leaf_treeposition(leaf_index)
-            for level, i in enumerate(range(len(tree_location))):
+            for i in range(len(tree_location)):
                 try:
                     label = hierarchy[tree_location[:i + 1]].label()
                 except:
                     label = hierarchy[tree_location[:i + 1]]
-                leaf_node_embeddings[class_idx] += orthonormal_basis_vectors[node_to_id[label]]
+                projections[class_idx] += (orthonormal_basis_vectors[node_to_id[label]][:, None] @ orthonormal_basis_vectors[node_to_id[label]][None, :])
+                for expand_dim in range(opts.expand_feat_dim):
+                    projections[class_idx] += (orthonormal_basis_vectors[opts.num_classes + expand_dim * len(classes) + class_][:, None] @ orthonormal_basis_vectors[opts.num_classes + expand_dim * len(classes) + class_][None, :])
 
-        leaf_node_embeddings = leaf_node_embeddings / torch.norm(leaf_node_embeddings, dim=1)[:, None]
+        distance_matrix = torch.zeros((len(classes), len(classes)), device=opts.gpu)
+        for c1 in classes:
+            for c2 in classes:
+                distance_matrix[classes.index(c1), classes.index(c2)] = distances[(c1, c2)]
+        distance_matrix = distance_matrix.max() - distance_matrix
+        opts.num_classes += (opts.expand_feat_dim * len(classes))
+
+        projections_expanded = projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
+
+        def get_distances(logits, batch_size=opts.batch_size, dim=opts.num_classes):
+            # Step 1: Expand logits to shape (batch_size, n_classes, dim)
+            n_classes = len(classes)
+            logits_expanded = logits.unsqueeze(1).expand(batch_size, n_classes, dim)  # Shape (batch_size, n_classes, dim)
+
+            # Step 2: Apply the projection matrices to each point in logits
+            # Matrix multiplication of shape (batch_size, n_classes, dim) @ (n_classes, dim, dim) -> (batch_size, n_classes, dim)
+            projected_points = torch.einsum('bcd,bced->bce', logits_expanded, projections_expanded)
+
+            # Step 3: Compute the Euclidean distance ||logits - projected_points||
+            # Shape (batch_size, n_classes, dim) - (batch_size, n_classes, dim) -> (batch_size, n_classes, dim) -> (batch_size, n_classes)
+            distances = torch.norm(logits_expanded - projected_points, dim=2)
+            return distances
+
+        def get_reg_loss(projection_norm, projection_labels):
+            normalized_out_distance = ((projection_norm - projection_norm.min(dim=1)[0][:, None]) / (projection_norm.max(dim=1)[0][:, None] - projection_norm.min(dim=1)[0][:, None])) * max_level
+            min_distances = distance_matrix[
+                projection_labels.unsqueeze(1), torch.arange(projection_norm.shape[1], device=projection_norm.device)]
+
+            # Create a mask for the range (min_distance, min_distance + 1)
+            mask = (normalized_out_distance > min_distances) & (normalized_out_distance < min_distances + 1)
+
+            # Initialize clamped_norm with absolute differences
+            clamped_norm = torch.square(normalized_out_distance - (min_distances + 0.5))
+
+            # Set values within the specified range to zero
+            clamped_norm[mask] = 0
+
+            return clamped_norm.sum(1) / clamped_norm.shape[0]
+
+        def get_reg_norm(logits, labels, batch_size=opts.batch_size, dim=opts.num_classes):
+            # Step 1: Expand logits to shape (batch_size, n_classes, dim)
+            n_classes = len(classes)
+            logits_expanded = logits.unsqueeze(1).expand(batch_size, n_classes, dim)  # Shape (batch_size, n_classes, dim)
+
+            # Step 2: Apply the projection matrices to each point in logits
+            # Matrix multiplication of shape (batch_size, n_classes, dim) @ (n_classes, dim, dim) -> (batch_size, n_classes, dim)
+            projected_points = torch.einsum('bcd,bced->bce', logits_expanded, projections_expanded)
+
+            # Step 3: Compute the Euclidean distance ||logits - projected_points||
+            # Shape (batch_size, n_classes, dim) - (batch_size, n_classes, dim) -> (batch_size, n_classes, dim) -> (batch_size, n_classes)
+            norm = torch.square(torch.norm(projected_points, dim=2))
+
+            reg_loss = get_reg_loss(norm, labels)
+            return reg_loss
 
     # shuffle hierarchy nodes
     if opts.shuffle_classes:
@@ -196,17 +246,20 @@ def main_worker(gpus_per_node, opts):
 
     # setup model
     model = init_model_on_gpu(gpus_per_node, opts, distances)
-    # if opts.feature_space == "haf++":
-    #     torch.nn.init.orthogonal_(model.classifier_3[0].linear2.weight)
+    if opts.feature_space == "haf++":
+        with torch.no_grad():
+            model.classifier_3[0].linear2.weight = nn.Parameter(orthonormal_basis_vectors)
+            model.classifier_3[0].linear2.weight.requires_grad_(False)
+        # torch.nn.init.orthogonal_(model.classifier_3[0].linear2.weight)
 
     # setup optimizer
     optimizer = _select_optimizer(model, opts)
 
     # load from checkpoint if existing
     if opts.feature_space == 'haf++':
-        steps, loaded_leaf_node_embeddings = _load_checkpoint(opts, model, optimizer)
-        if loaded_leaf_node_embeddings is not None:
-            leaf_node_embeddings = loaded_leaf_node_embeddings
+        steps, loaded_projections = _load_checkpoint(opts, model, optimizer)
+        if loaded_projections is not None:
+            projections = loaded_projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
     else:
         steps = _load_checkpoint(opts, model, optimizer)
 
@@ -234,19 +287,15 @@ def main_worker(gpus_per_node, opts):
     elif opts.loss == "cosine-plus-xent":
         loss_function = CosinePlusXentLoss(emb_layer).cuda(opts.gpu)
     elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
-
         def loss_func(logits, labels, m=0, log=0):
-            out = -torch.sqrt((torch.norm(logits, dim=1)[:, None] ** 2) * (1 - F.cosine_similarity(logits[:, :, None], leaf_node_embeddings.t()[None, :, :]) ** 2))
-            # margin = 1 + torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
-            # cross-entropy loss
-            loss_ce = F.cross_entropy(out, labels, reduce=False)
-            # distance between the true hyperplane (gt) and feature point
-            loss_true = -out[range(labels.shape[0]), labels]
-            # avg distance between false hyperplanes and feature point
-            loss_false = m - torch.clamp(-(out.sum(1) - out[range(labels.shape[0]), labels]) / (out.shape[1] - 1), 0, m)
-            loss = loss_ce.mean() + loss_true.mean() + loss_false.mean()
+            out = -get_distances(logits)
+            margin = 1 + torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
+            loss_ce = F.cross_entropy(out * margin, labels)
+            loss_reg = get_reg_norm(logits, labels)
+            alpha = 0.6
+            loss = alpha * loss_ce.mean() + (1 - alpha) * loss_reg.mean()
             if log == 0:
-                print(f"CE: {loss_ce.mean().item()} | True: {loss_true.mean().item()} | False: {loss_false.mean().item()}")
+                print(f"CE: {alpha * loss_ce.mean().item()} | Reg: {(1 - alpha) * loss_reg.mean().item()}")
             return loss, out
         loss_function = loss_func
     elif opts.loss in LOSS_NAMES:
@@ -276,52 +325,55 @@ def main_worker(gpus_per_node, opts):
         if opts.data == "inaturalist19-224":
             if opts.loss == "cross-entropy" and opts.optimizer == "custom_sgd":
                 if opts.arch == "custom_resnet18":
-                    optimizer.param_groups[0]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                    optimizer.param_groups[1]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                    optimizer.param_groups[2]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) / 10
+                    optimizer.param_groups[0]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                    optimizer.param_groups[1]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                    optimizer.param_groups[2]['lr'] = cosine_anneal_schedule(epoch, opts.epochs) / 10
             elif (opts.loss == "ours-l7-cejsd" or opts.loss == "ours-l7-cejsd-wtconst" or opts.loss == "ours-l7-cejsd-wtconst-dissim"):
-                optimizer.param_groups[0]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)
-                optimizer.param_groups[1]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[2]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[3]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[4]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[5]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[6]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[7]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[8]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) / 10
+                optimizer.param_groups[0]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[1]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[2]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[3]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[4]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[5]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[6]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[7]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[8]['lr'] = cosine_anneal_schedule(epoch, opts.epochs) / 10
         if opts.data == "tiered-imagenet-224":
             if (opts.loss == "cross-entropy" and opts.optimizer == "custom_sgd"):
-                optimizer.param_groups[0]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[1]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[2]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) / 10
+                optimizer.param_groups[0]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[1]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[2]['lr'] = cosine_anneal_schedule(epoch, opts.epochs) / 10
             elif (opts.loss == "flamingo-l12" and opts.optimizer == "custom_sgd"):
-                optimizer.param_groups[0]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)
-                optimizer.param_groups[1]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[2]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[3]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[4]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[5]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[6]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[7]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[8]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)
-                optimizer.param_groups[9]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
+                optimizer.param_groups[0]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[1]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[2]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[3]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[4]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[5]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[6]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[7]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[8]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[9]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
                 optimizer.param_groups[10]['lr'] = cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[11]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)
-                optimizer.param_groups[12]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) 
-                optimizer.param_groups[13]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) / 10
+                optimizer.param_groups[11]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[12]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                optimizer.param_groups[13]['lr'] = cosine_anneal_schedule(epoch, opts.epochs) / 10
         if opts.data == "cifar-100":
             if opts.optimizer == "custom_sgd":
-                if opts.loss == "cross-entropy": #or opts.loss == "soft-labels" or opts.loss == "hierarchical-cross-entropy":
-                    optimizer.param_groups[0]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)
-                    optimizer.param_groups[1]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) / 10
-                if (opts.loss == "ours-l5-cejsd-wtconst-dissim" or opts.loss == "flamingo-l5" or opts.loss == "ours-l5-cejsd-wtconst" or \
+                if opts.loss == "cross-entropy" and opts.feature_space == "haf++":
+                    optimizer.param_groups[0]['lr'] = cosine_anneal_schedule(epoch, opts.epochs, opts.lr)
+                    optimizer.param_groups[1]['lr'] = cosine_anneal_schedule(epoch, opts.epochs, opts.lr) / 10
+                elif opts.loss == "cross-entropy": #or opts.loss == "soft-labels" or opts.loss == "hierarchical-cross-entropy":
+                    optimizer.param_groups[0]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)
+                    optimizer.param_groups[1]['lr'] = cosine_anneal_schedule(epoch, opts.epochs) / 10
+                elif (opts.loss == "ours-l5-cejsd-wtconst-dissim" or opts.loss == "flamingo-l5" or opts.loss == "ours-l5-cejsd-wtconst" or \
                     opts.loss == "ours-l5-cejsd"):
-                    optimizer.param_groups[0]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)       # level 1
-                    optimizer.param_groups[1]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)       # level 2
-                    optimizer.param_groups[2]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)       # level 3
-                    optimizer.param_groups[3]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)       # level 3
-                    optimizer.param_groups[4]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs)       # level 3
-                    optimizer.param_groups[5]['lr'] =  cosine_anneal_schedule(epoch, opts.epochs) / 10  # backbone
+                    optimizer.param_groups[0]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)       # level 1
+                    optimizer.param_groups[1]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)       # level 2
+                    optimizer.param_groups[2]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)       # level 3
+                    optimizer.param_groups[3]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)       # level 3
+                    optimizer.param_groups[4]['lr'] = cosine_anneal_schedule(epoch, opts.epochs)       # level 3
+                    optimizer.param_groups[5]['lr'] = cosine_anneal_schedule(epoch, opts.epochs) / 10  # backbone
 
         if opts.devise or opts.barzdenzler:
             # two-stage training for devise and b+d
@@ -342,7 +394,7 @@ def main_worker(gpus_per_node, opts):
         # print summary of the epoch and save checkpoint
         state = {"epoch": epoch + 1, "steps": steps, "arch": opts.arch, "state_dict": model.state_dict(), "optimizer": optimizer.state_dict()}
         if opts.feature_space == 'haf++':
-            state["leaf_node_embeddings"] = leaf_node_embeddings
+            state["projections"] = projections
         _save_checkpoint(state, opts.out_folder)
         print("\nSummary for epoch %04d (for train set):" % epoch)
         pp.pprint(summary_train)
@@ -378,9 +430,9 @@ def _load_checkpoint(opts, model, optimizer):
         steps = checkpoint["steps"]
         print("=> loaded checkpoint '{}' (epoch {})".format(opts.out_folder, checkpoint["epoch"]))
         if opts.feature_space == 'haf++':
-            leaf_node_embeddings = checkpoint["leaf_node_embeddings"]
-            print("loaded leaf_node_embeddings")
-            return steps, leaf_node_embeddings
+            projections = checkpoint["projections"]
+            print("loaded level_wise_projections")
+            return steps, projections
     elif opts.pretrained_folder is not None:
         # import pdb; pdb.set_trace()
         if os.path.exists(opts.pretrained_folder):
