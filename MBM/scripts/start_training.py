@@ -166,16 +166,16 @@ def main_worker(gpus_per_node, opts):
                 for expand_dim in range(opts.expand_feat_dim):
                     projections[class_idx] += (orthonormal_basis_vectors[opts.num_classes + expand_dim * len(classes) + class_][:, None] @ orthonormal_basis_vectors[opts.num_classes + expand_dim * len(classes) + class_][None, :])
 
-        distance_matrix = torch.zeros((len(classes), len(classes)), device=opts.gpu)
+        distance_matrix = torch.zeros((len(classes), len(classes)), device=opts.gpu, dtype=torch.float64)
         for c1 in classes:
             for c2 in classes:
                 distance_matrix[classes.index(c1), classes.index(c2)] = distances[(c1, c2)]
         distance_matrix = distance_matrix.max() - distance_matrix
         opts.num_classes += (opts.expand_feat_dim * len(classes))
 
-        projections_expanded = projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
+        # projections_expanded = projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
 
-        def get_distances(logits, projections, batch_size=opts.batch_size, dim=opts.num_classes):
+        def get_distances(logits, labels, projections, batch_size=opts.batch_size, dim=opts.num_classes, log=0):
             # Step 1: Apply the projection matrices to each point in logits
             # We avoid expanding logits and use broadcasting directly
             n_classes = len(classes)
@@ -187,40 +187,36 @@ def main_worker(gpus_per_node, opts):
 
             # Step 2: Compute the Euclidean distance ||logits - projected_points||
             # We use broadcasting directly without expanding
-            distances = torch.norm(logits - projected_points, dim=2)
-            return distances
+            # distances = torch.norm(logits - projected_points, dim=2)
+            projection_norm = torch.norm(projected_points, dim=2)
 
-        def get_reg_loss(projection_norm, projection_labels):
-            normalized_out_distance = ((projection_norm - projection_norm.min(dim=1)[0][:, None]) / (projection_norm.max(dim=1)[0][:, None] - projection_norm.min(dim=1)[0][:, None])) * max_level
-            min_distances = distance_matrix[
-                projection_labels.unsqueeze(1), torch.arange(projection_norm.shape[1], device=projection_norm.device)]
+            # if log == 0:
+            #     print((projection_norm[range(logits.shape[0]), labels] / torch.square(torch.norm(logits, dim=2)[:, 0])).mean())
 
-            # Create a mask for the range (min_distance, min_distance + 1)
-            mask = (normalized_out_distance > min_distances) & (normalized_out_distance < min_distances + 1)
+            reg_loss = get_reg_loss(projection_norm, labels, log)  # + (1 - projection_norm[range(logits.shape[0]), labels] / torch.square(torch.norm(logits, dim=2)[:, 0]))
+            reg_true_dist = 1 - projection_norm[range(logits.shape[0]), labels] / torch.norm(logits, dim=2)[:, 0]
+            return projection_norm, reg_loss, reg_true_dist
+
+        def get_reg_loss(projection_norm, projection_labels, log=0):
+            # normalized_out_distance = ((projection_norm - projection_norm.min(dim=1)[0][:, None]) / (projection_norm.max(dim=1)[0][:, None] - projection_norm.min(dim=1)[0][:, None])) * max_level
+            normalized_out_distance = projection_norm
+            dm = distance_matrix[projection_labels.unsqueeze(1), torch.arange(projection_norm.shape[1], device=projection_norm.device)]
+            min_distances = torch.exp(dm - 1)
+            max_distances = torch.exp(dm)
+            min_distances = torch.where(min_distances < 1, 0., min_distances)
+
+            # mask = (normalized_out_distance >= min_distances) & (normalized_out_distance < max_distances)
 
             # Initialize clamped_norm with absolute differences
-            clamped_norm = torch.square(normalized_out_distance - (min_distances + 0.5))
+            clamped_norm = torch.square(normalized_out_distance - (min_distances + (min_distances + max_distances) / 2.))
 
             # Set values within the specified range to zero
-            clamped_norm[mask] = 0
+            # clamped_norm[mask] = 0
+            # import pdb; pdb.set_trace()
+            # if log == 0:
+            #     print(f"{normalized_out_distance[range(projection_norm.shape[0]), projection_labels].mean()}")
 
-            return clamped_norm.sum(1) / clamped_norm.shape[0]
-
-        def get_reg_norm(logits, labels, projections, batch_size=opts.batch_size, dim=opts.num_classes):
-            # Step 1: Apply the projection matrices to each point in logits
-            # We avoid expanding logits and use broadcasting directly
-            n_classes = len(classes)
-            logits = logits.view(batch_size, 1, dim)
-            projections = projections.view(1, n_classes, dim, dim)
-
-            # Matrix multiplication of shape (batch_size, 1, dim) @ (1, n_classes, dim, dim) -> (batch_size, n_classes, dim)
-            projected_points = torch.einsum('bid,bicd->bic', logits, projections)
-
-            # Step 2: Compute the squared Euclidean norm ||projected_points||
-            norm = torch.square(torch.norm(projected_points, dim=2))
-
-            reg_loss = get_reg_loss(norm, labels)
-            return reg_loss
+            return clamped_norm.sum(1)
 
     # shuffle hierarchy nodes
     if opts.shuffle_classes:
@@ -261,7 +257,7 @@ def main_worker(gpus_per_node, opts):
         steps, loaded_projections = _load_checkpoint(opts, model, optimizer)
         if loaded_projections is not None:
             projections = loaded_projections
-            projections_expanded = projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
+            # projections_expanded = projections.unsqueeze(0).expand(opts.batch_size, len(classes), opts.num_classes, opts.num_classes)
     else:
         steps = _load_checkpoint(opts, model, optimizer)
 
@@ -290,14 +286,19 @@ def main_worker(gpus_per_node, opts):
         loss_function = CosinePlusXentLoss(emb_layer).cuda(opts.gpu)
     elif opts.loss == "cross-entropy" and opts.feature_space == "haf++":
         def loss_func(logits, labels, m=0, log=0):
-            out = -get_distances(logits, projections)
+            out, loss_reg, loss_reg_true_dist = get_distances(logits, labels, projections, log=log)
             margin = 1 + torch.zeros_like(out).scatter_(1, labels.unsqueeze(1), m)
             loss_ce = F.cross_entropy(out * margin, labels)
-            loss_reg = get_reg_norm(logits, labels, projections)
-            alpha = 0.6
-            loss = alpha * loss_ce.mean() + (1 - alpha) * loss_reg.mean()
+            # loss_reg += torch.clamp(-out[range(labels.shape[0]), labels] * 2 + out[range(labels.shape[0])].topk(2)[0][:, 1], 0, float("inf"))
+            # loss_reg = get_reg_norm(logits, labels, projections)
+            alpha = 0.8
+            loss = alpha * loss_ce.mean() + (1 - alpha) * torch.sqrt(loss_reg.mean())  # + loss_reg_true_dist.mean()
+            # loss = torch.sqrt(loss_reg.mean()) # + loss_reg_true_dist.mean()
             if log == 0:
-                print(f"CE: {alpha * loss_ce.mean().item()} | Reg: {(1 - alpha) * loss_reg.mean().item()}")
+                print(f"CE: {loss_ce.mean().item()} | Reg: {torch.sqrt(loss_reg.mean()).item()} "
+                      f"| Reg True Dist: {loss_reg_true_dist.mean().item()} "
+                      f"| True Dist: {out[range(labels.shape[0]), labels].mean()} "
+                      f"| Top Dist: {out.max(1)[0].mean()}")
             return loss, out
         loss_function = loss_func
     elif opts.loss in LOSS_NAMES:

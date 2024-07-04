@@ -103,6 +103,8 @@ def main(test_opts):
         for c1 in classes:
             for c2 in classes:
                 distance_matrix[classes.index(c1), classes.index(c2)] = distances[(c1, c2)]
+        distance_matrix = distance_matrix.max() - distance_matrix
+        opts.num_classes += (opts.expand_feat_dim * len(classes))
 
         def map_tree_to_ids_bfs(tree):
             node_to_id = {}
@@ -185,6 +187,7 @@ def main(test_opts):
 
             # Set values within the specified range to zero
             clamped_norm[mask] = 0
+            # import pdb; pdb.set_trace()
 
             return clamped_norm.sum(1) / clamped_norm.shape[0]
 
